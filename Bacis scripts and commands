@@ -1,0 +1,198 @@
+1. Process of raw reads, alignments and variant calling
+#index reference
+samtools dict ninespine.fa > ninespine.dict
+samtools faidx ninespine.fa
+bwa index ninespine.fa
+
+#reads alignment
+bwa mem -M -R "@RG\tID:SampleID tSM:SampleID tPL:illumina tLB:SampleID tPU:1" ninespine.fa SampleID_1.fq.gz SampleID_2.fq.gz | samtools view -F4 -h -Obam -o sample1_bwa.bam
+
+#sort reads by coordinate, duplicates remove and index
+samtools sort -T /tmp/SampleID -O bam -o SampleID_bwa_sorted.bam SampleID_bwa.bam
+samtools rmdup SampleID_bwa_sorted.bam SampleID_bwa_rmdup.bam
+samtools index SampleID_bwa_rmdup.bam SampleID_bwa_rmdup.bai
+
+#realignment around indels
+gatk -T RealignerTargetCreator -R ninespine.fa -I SampleID_bwa_rmdup.bam -o SampleID_intervals.list
+
+gatk -T IndelRealigner -R ninespine.fa -I SampleID_ bwa_rmdup.bam -targetIntervals SampleID_intervals.list -o SampleID_realn.bam
+
+#sort and index of cleaned bam
+samtools sort -T /tmp/SampleID -O bam -o SampleID_realn_rmdup_sorted.bam SampleID_realn.bam
+samtools index SampleID_realn_rmdup_sorted.bam SampleID_realn_rmdup.bai
+
+#Variant calling
+#individual call
+gatk -T HaplotypeCaller -R ninespine.fa -I SampleID_realn_rmdup_sorted.bam -gt_mode DISCOVERY -ERC GVCF -stand_emit_conf 3 -stand_call_conf 10 -GQB 10 -GQB 20 -GQB 30 -GQB 40 -GQ 50 -variant_index_type LINEAR -variant_index_parameter 128000 -o /dev/stdout | bgzip -s - > data/SampleID.calls.gvcf.gz
+
+#joint calling of all samples
+bcftools index -t SampleID.calls.gvcf.gz
+
+gatk -T GenotypeGVCFs -R ninespine.fa -V Sample1.calls.gvcf.gz .....
+-V Sample290.calls.gvcf.gz -o /dev/stdout | bcftools view -Oz -o Samples.calls.vcf.gz &
+
+#filter the raw output vcf file
+bcftools view -T ^outgroup_sites_to_remove.tab Samples.calls.vcf.gz -Oz -o Samples.ogrm.vcf.gz 
+
+bcftools filter -g 10 Samples.ogrm.vcf.gz | bcftools view -m2 -M2 -v snps -Oz -o Samples.ogrm.clean1.vcf.gz
+ 
+bcftools filter -g 20 Samples.ogrm.clean1.vcf.gz -Oz -o Samples.ogrm.clean2.vcf.gz
+
+bcftools view -m2 -M2 -V mnps,indels -T ^repeats.tab Samples.ogrm.clean2.vcf.gz -Oz -o nsp290_clean.vcf.gz
+
+#exclude sex-chormosome data
+bcftools view -t ^LG12 nsp290_clean.vcf.gz -Oz -o nsp290_clean_auto.vcf.gz
+
+
+2. filtering data for different analysis start with nsp290_clean_auto.vcf.gz
+#controlling quality and read depth
+vcftools --gzvcf nsp290_clean_auto.vcf.gz --minQ 30 --min-meanDP 5 --max-meanDP 25 --recode --recode-INFO-all -c | bcftools view -Oz -o nsp290_clean.q30.min_mean5.maxmean25.vcf.gz
+
+#filtering data for ADMIXTURE anlaysis
+vcftools --gzvcf nsp290_clean.q30.min_mean5.maxmean25.vcf.gz --max-missing 0.75 --minQ 30 --min-meanDP 6.5 --max-meanDP 20 --recode --recode-INFO-all -c |vcftools --vcf - --thin 10000 --stdout --recode --recode-INFO-all | gzip -c > ADMIXTURE_thinned10K.vcf.gz
+
+
+#filtering data for ADMIXTOOLS related anlaysis (D-stat f4-ratio)
+bcftools view nsp290_clean.q30.min_mean5.maxmean25.vcf.gz | vcftools --vcf - --max-missing 0.9 --recode --recode-INFO-all -c |bcftools view -Oz -o ADMIXTOOLS.vcf.gz
+
+#filtering data for summary statistics
+bcftools view nsp290_clean.q30.min_mean5.maxmean25.vcf.gz|vcftools --vcf - --max-missing 0.8 --recode --recode-INFO-all -c |bcftools view -Oz -o fd.mm20.vcf.gz
+
+3. PCA and ADMIXTURE analysis
+#omit LG in chr field avoid crash
+zcat ADMIXTURE_thinned10K.vcf.gz | awk '{gsub(/^LG/,""); print}' | bgzip > ADMIXTURE_thinned10K_noLG.vcf.gz 
+
+#convert format to plink format
+vcftools --gzvcf ADMIXTURE_thinned10K_noLG.vcf.gz --plink --out ADMIXTURE
+#make bed files
+plink --file ADMIXTURE --make-bed --out ADMIXTURE --noweb 
+#do PCA via plink
+plink --bfile ADMIXTURE --distance 1-ibs square gz --pca --out ADMIXTURE --noweb
+#run admixture with k=2
+admixture --cv ADMIXTURE.bed 2 | tee log2.out
+
+4. D-statistics and f4-ratio test
+#remove LG from chr field avoid program crash
+zcat ADMIXTOOLS.vcf.gz | sed 's/^LG//' | bgzip > Admixtools_noLG.vcf.gz 
+
+#convert format
+#convert to plink format
+vcftools --gzvcf Admixtools_noLG.vcf.gz --plink --out Admixtools_noLG
+
+#make a par file for admixtools 
+cat > Convert.par << EOF
+genotypename:    Admixtools_noLG.ped
+snpname:         Admixtools_noLG.map 
+indivname:       Admixtools_noLG.ped 
+outputformat:    EIGENSTRAT
+genotypeoutname: Admixtools_noLG.geno
+snpoutname:      Admixtools_noLG.snp
+indivoutname:    Admixtools_noLG.ind
+familynames:     NO
+EOF
+
+convertf -p Convert.par
+
+#run D-statisitcs and f4-ratio test
+qpDstat -p par_Dstat > out/Dstat_whole_genome.out
+qpF4ratio -p par_f4ratio > out/f4ratio_whole_genome.out
+
+5.Demorgraphic history re-construction via SMC++
+#convert data from vcf into required input type for each LG (e.g. LG1, LG2....)
+p="Population"
+l="Population:Distinguished_ind,ind_1,ind_2,ind_3......ind_20"
+mkdir -p $p
+for K in $(cat LGs.txt); do \
+echo $K;
+ smc++ vcf2smc nsp290_clean_auto.vcf.gz $p/$K.smc.gz $K $l --cores 4 
+done
+
+#run SMC++ inference
+r="1.42e-8" #set mutation rate
+mkdir Population_output 
+smc++ cv -o Population_output/ $r $p/*.smc.gz  --cores 4 --timepoints 1e3 1e6 --folds 4 --regularization-penalty 5 --ftol 0.01
+
+#plot result -g 2 assign generation length to be 2 years/generation and write a csv file for further plotting
+smc++ plot -g 2 $p.g2.png Population_output/model.final.json -c
+
+#plot result not scaling into real time
+smc++ plot $p.png Population_output/model.final.json -c
+
+6.Quantification of introgression across the genome via fd statistics
+#split data into each LG and convert the format
+for K in `seq 1 21`
+do
+echo LG${K}
+bcftools view -r LG${K} nsp290_clean.q30.min_mean5.maxmean25.vcf.gz -Oz -o LG${K}.vcf.gz
+python parseVCF.py -i LG${K}.vcf.gz --skipIndels --minQual 30 | gzip > geno/LG${K}.geno.gz
+done
+
+# run fd for each target admixed population with different reference population, control for missing rate allow maximum 20% missing data, in 100-kb window with 20-kb step
+for g in `seq 1 21`
+do
+python ABBABABAwindows.py -g geno/LG$g.geno.gz -f phased -o fd/100kb_s20/LG${g}_abba_ref_target_source_outgroup_W100_S20.csv -w 100000 -s 20000 -m 5 --popsFile poplist_eachpop.txt -P1 reference -P2 target -P3 source -O outgroup -T 4 --minData 0.8 --writeFailedWindows
+done
+
+#calculate FST dxy pi in 10-kb with 5-kb step 
+#first controll for missing rate allow maximum 20% missing data
+for K in `seq 1 21`
+do
+echo LG${K}
+bcftools view -r LG${K} nsp290_clean.q30.min_mean5.maxmean25.vcf.gz |vcftools --vcf - --max-missing 0.8 --recode --recode-INFO-all -c |bcftools view -Oz -o mm20/LG${K}.vcf.gz
+python parseVCF.py -i mm20/LG${K}.vcf.gz --skipIndels --minQual 30 | gzip > geno_mm20/LG${K}.geno.gz
+done
+#then calculate pi FST dxy
+for g in `seq 1 21`
+do
+python popgenWindows.py -w 10000 -m 5 -s 5000 -g geno_mm20/LG${g}.geno.gz -o summary_stats/10kb_s5/LG${g}_summary_stats_focus_pops_w10_s5_mm20.csv --popsFile poplist.txt -p pop1 -p pop2 ..... -p pop14 -f phased -T 4 --writeFailedWindows 
+done 
+
+
+7. Screen for footprints of selection on introgressed variants via U and Q95 test.
+7.1 Estimate allele frequencies for each population 
+for i in `seq 1 21`
+do
+bcftools view -r LG${i} -S EL nsp290_clean.q30.min_mean5.maxmean25.vcf.gz | vcftools --vcf - --freq2 --out vaf/EL_freq_LG${i}
+bcftools view -r LG${i} -S WL nsp290_clean.q30.min_mean5.maxmean25.vcf.gz | vcftools --vcf - --freq2 --out vaf/WL_freq_LG${i}
+bcftools view -r LG${i} -S BALTIC nsp290_clean.q30.min_mean5.maxmean25.vcf.gz | vcftools --vcf - --freq2 --out vaf/BALTIC_freq_LG${i}
+bcftools view -r LG${i} -S SWEBYN nsp290_clean.q30.min_mean5.maxmean25.vcf.gz | vcftools --vcf - --freq2 --out vaf/SWEBYN_freq_LG${i}
+done
+
+7.2 U and Q95 test in R
+see U,Q95,FST test and classification.R
+
+7.3 SNP classfication in R
+see U,Q95,FST test and classification.R
+
+8. Effect of introgression on FST outlier detection
+8.1 Calculate per-site FST for each pair/scenario while controlling for data quality
+
+bcftools view -t ^LG12 --min-ac=1 -S list_of_all_individuals_involved \
+nsp290_clean.q30.min_mean5.maxmean25.vcf.gz | vcftools --vcf - --max-missing 0.8 --maf 0.05 --recode --recode-INFO-all -c |vcftools --vcf - --weir-fst-pop Focal_popualtion1 --weir-fst-pop Reference_population1 --out persite/Foacl1_Ref1
+
+8.2 Classification of SNPs in R
+see U,Q95,FST test and classification.R
+
+9. Effect of introgression on phylogenetic analysis
+
+9.1 Generate single locus trees for 1000 random selected loci 
+
+for i in $(ls *.phy)
+do
+raxmlHPC-PTHREADS-AVX -T 4 -m GTRGAMMA --asc-corr=lewis -p 12345 -s ${i} -n ${i} -o outgroup_sample
+done
+
+9.2 Generate a single ML besttree using concatenated data with 100 bootstrap
+ 
+raxmlHPC-PTHREADS-AVX -T 4 -m GTRGAMMA --asc-corr=lewis -p 12345 -b 12345 -# 100 -s concatenated.phy -n ALL_LOCI -o outgroup_sample
+
+raxmlHPC-PTHREADS-AVX -m GTRCAT -p 12345 -f b -t concatenate_RAxML_bestTree -z concatenate_RAxML_bootstrap -n concatenate_bipartition -o outgroup_sample
+
+9.3 Bootstrap single locus tree against the concatenated best tree
+
+cat single_locus_trees/*.phy > single_locus.bootstrap
+
+raxmlHPC-PTHREADS-AVX -m GTRCAT -p 12345 -f b -t concatenate_RAxML_bestTree -z single_locus.bootstrap -n single_locus_bipartition -o outgroup_sample
+
+9.4 Tree classification in R
+see tree_classification.r
